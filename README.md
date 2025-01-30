@@ -1,8 +1,5 @@
-# 🐱 MEOW - Roblox Memory Scanner
+# 🐱 MEOW
 
-<p align="center">
-  <img src="https://your-banner-image-url-here.png" alt="MEOW Banner" width="600"/>
-</p>
 
 ## 🌟 Overview
 

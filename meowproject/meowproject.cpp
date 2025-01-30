@@ -1,14 +1,14 @@
-﻿#include <Windows.h>
+#include <Windows.h>
 #include <vector>
 #include <string>
 #include <thread>
 #include <mutex>
-#include <future>
 #include <algorithm>
 #include <TlHelp32.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <chrono>
 
 namespace Colors {
     void SetColor(int color) {
@@ -84,31 +84,6 @@ private:
     HANDLE processHandle;
     uintptr_t moduleBase;
 
-    std::vector<uintptr_t> FindAllPatterns(const std::vector<BYTE>& data, const std::vector<BYTE>& pattern, uintptr_t baseAddress) {
-        std::vector<uintptr_t> results;
-        size_t patternLength = pattern.size();
-        size_t dataLength = data.size();
-
-        for (size_t i = 0; i <= dataLength - patternLength; i++) {
-            bool found = true;
-            for (size_t j = 0; j < patternLength; j++) {
-                if (pattern[j] != 0x00 && pattern[j] != data[i + j]) {
-                    found = false;
-                    break;
-                }
-            }
-            if (found) {
-                results.push_back(baseAddress + i);
-            }
-        }
-        return results;
-    }
-
-    uintptr_t FindPattern(const std::vector<BYTE>& data, const std::vector<BYTE>& pattern, uintptr_t baseAddress) {
-        auto results = FindAllPatterns(data, pattern, baseAddress);
-        return results.empty() ? 0 : results[0];
-    }
-
 public:
     Memory(HANDLE handle, uintptr_t base) : processHandle(handle), moduleBase(base) {}
 
@@ -129,68 +104,74 @@ public:
 
     std::vector<uintptr_t> AOBScanAll(const std::string& pattern, bool returnMultiple = false, int stopAtValue = 1) {
         std::vector<uintptr_t> results;
-        std::vector<MemoryRegion> regions;
+        const auto startTime = std::chrono::high_resolution_clock::now();
+
         std::vector<BYTE> bytePattern = StringToPattern(pattern);
+        const size_t patternSize = bytePattern.size();
+        if (patternSize == 0) return results;
+
+        const BYTE firstByte = bytePattern[0];
 
         MEMORY_BASIC_INFORMATION mbi;
-        uintptr_t address = 0;
+        uintptr_t address = moduleBase; 
+
+        Colors::SetColor(Colors::YELLOW);
+        std::cout << "[scan]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " Starting memory scan...\n";
+
 
         while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
-            if (mbi.State == MEM_COMMIT &&
-                (mbi.Protect == PAGE_EXECUTE_READ ||
+            if (mbi.State != MEM_COMMIT ||
+                !(mbi.Protect == PAGE_EXECUTE_READ ||
                     mbi.Protect == PAGE_EXECUTE_READWRITE ||
                     mbi.Protect == PAGE_READWRITE ||
-                    mbi.Protect == PAGE_READONLY))
-            {
-                regions.push_back({
-                    (uintptr_t)mbi.BaseAddress,
-                    mbi.RegionSize,
-                    mbi.State,
-                    mbi.Protect,
-                    mbi.AllocationProtect
-                    });
-
-                std::cout << "Scanning region at: " << FormatAddress((uintptr_t)mbi.BaseAddress)
-                    << " Size: 0x" << std::hex << mbi.RegionSize
-                    << " Protect: 0x" << std::hex << mbi.Protect << std::dec << std::endl;
+                    mbi.Protect == PAGE_READONLY)) {
+                address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                continue;
             }
+
+            std::vector<BYTE> buffer(mbi.RegionSize);
+            SIZE_T bytesRead;
+
+            if (!ReadProcessMemory(processHandle, (LPCVOID)mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytesRead)) {
+                address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                continue;
+            }
+
+            for (size_t i = 0; i <= bytesRead - patternSize; i++) {
+                if (buffer[i] != firstByte) continue;
+
+                bool found = true;
+                for (size_t j = 1; j < patternSize; j++) {
+                    if (bytePattern[j] != 0x00 && bytePattern[j] != buffer[i + j]) {
+                        found = false;
+                        break;
+                    }
+                }
+
+                if (found) {
+                    results.push_back((uintptr_t)mbi.BaseAddress + i);
+                    if (!returnMultiple || (stopAtValue > 0 && results.size() >= static_cast<size_t>(stopAtValue))) {
+                        goto SCAN_COMPLETE;
+                    }
+                }
+            }
+
             address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         }
 
-        std::cout << "Total regions to scan: " << regions.size() << std::endl;
+    SCAN_COMPLETE:
+        const auto endTime = std::chrono::high_resolution_clock::now();
+        const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
-        std::vector<std::future<std::vector<uintptr_t>>> futures;
-        std::mutex resultsMutex;
+        Colors::SetColor(Colors::GREEN);
+        std::cout << "[time]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " Scan completed in " << duration.count() / 1000.0 << "ms ("
+            << std::fixed << std::setprecision(3) << (duration.count() / 1000000.0) << "s)\n";
 
-        for (const auto& region : regions) {
-            futures.push_back(std::async(std::launch::async, [&, region]() {
-                std::vector<BYTE> data(region.size);
-                if (ReadProcessMemory(processHandle, (LPCVOID)region.base, data.data(), region.size, nullptr)) {
-                    if (returnMultiple) {
-                        return FindAllPatterns(data, bytePattern, region.base);
-                    }
-                    else {
-                        uintptr_t result = FindPattern(data, bytePattern, region.base);
-                        return result ? std::vector<uintptr_t>{result} : std::vector<uintptr_t>();
-                    }
-                }
-                return std::vector<uintptr_t>();
-                }));
-        }
 
-        for (auto& future : futures) {
-            auto threadResults = future.get();
-            if (!threadResults.empty()) {
-                std::lock_guard<std::mutex> lock(resultsMutex);
-                results.insert(results.end(), threadResults.begin(), threadResults.end());
-
-                if (!returnMultiple || (stopAtValue > 0 && results.size() >= static_cast<size_t>(stopAtValue))) {
-                    break;
-                }
-            }
-        }
-
-        std::sort(results.begin(), results.end());
         return results;
     }
 };
@@ -215,38 +196,36 @@ void SetConsoleWindowSize(int width, int height) {
     MoveWindow(console, r.left, r.top, width, height, TRUE);
 }
 
-
 int main() {
     SetConsoleTitle(L"MEOW");
     SetConsoleFontSize(14);
 
     SetConsoleWindowSize(700, 350);
 
-    Colors::SetColor(Colors::WHITE);
-    std::cout << "[";
     Colors::SetColor(Colors::YELLOW);
-    std::cout << "init";
+    std::cout << "[init]";
     Colors::SetColor(Colors::WHITE);
-    std::cout << "] Searching for Roblox process...\n";
+    std::cout << " Searching for Roblox process...\n";
 
     DWORD processId = GetProcessIDByName(L"RobloxPlayerBeta.exe");
     if (processId == 0) {
         Colors::SetColor(Colors::RED);
-        std::cout << "[error] Failed to find Roblox process\n";
+        std::cout << "[error]";
         Colors::SetColor(Colors::WHITE);
+        std::cout << " Failed to find Roblox process\n";
         system("pause");
         return 1;
     }
 
     Colors::SetColor(Colors::GREEN);
-    std::cout << "[success] Found Roblox process ID: " << processId << std::endl;
+    std::cout << "[success]";
+    Colors::SetColor(Colors::WHITE);
+    std::cout << " Found Roblox process ID: " << processId << std::endl;
 
-    Colors::SetColor(Colors::WHITE);
-    std::cout << "[";
     Colors::SetColor(Colors::YELLOW);
-    std::cout << "init";
+    std::cout << "[init]";
     Colors::SetColor(Colors::WHITE);
-    std::cout << "] Acquiring process handle...\n";
+    std::cout << " Acquiring process handle...\n";
 
     HANDLE hProcess = OpenProcess(
         PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
@@ -256,47 +235,54 @@ int main() {
 
     if (hProcess == NULL) {
         Colors::SetColor(Colors::RED);
-        std::cout << "[error] Failed to open process. Error: " << GetLastError() << std::endl;
+        std::cout << "[error]";
         Colors::SetColor(Colors::WHITE);
+        std::cout << " Failed to open process\n";
         system("pause");
         return 1;
     }
 
     Colors::SetColor(Colors::GREEN);
-    std::cout << "[succes] Process handle acquired\n";
+    std::cout << "[success]";
+    Colors::SetColor(Colors::WHITE);
+    std::cout << " Process handle acquired\n";
 
-    Colors::SetColor(Colors::WHITE);
-    std::cout << "[";
     Colors::SetColor(Colors::YELLOW);
-    std::cout << "init";
+    std::cout << "[init]";
     Colors::SetColor(Colors::WHITE);
-    std::cout << "] Getting base address...\n";
+    std::cout << " Getting base address...\n";
 
     uintptr_t baseAddress = GetModuleBaseAddress(processId, L"RobloxPlayerBeta.exe");
     if (baseAddress == 0) {
         Colors::SetColor(Colors::RED);
-        std::cout << "[error] Failed to get base address\n";
+        std::cout << "[error]";
         Colors::SetColor(Colors::WHITE);
+        std::cout << " Failed to get base address\n";
         CloseHandle(hProcess);
         system("pause");
         return 1;
     }
 
     Colors::SetColor(Colors::GREEN);
-    std::cout << "[success] Base address: " << FormatAddress(baseAddress) << "\n\n";
+    std::cout << "[success]";
+    Colors::SetColor(Colors::WHITE);
+    std::cout << " Base address: " << FormatAddress(baseAddress) << "\n\n";
 
     Memory mem(hProcess, baseAddress);
 
     Colors::SetColor(Colors::PURPLE);
-    std::cout << "STARTING MEOW SCAN\n";
-
+    std::cout << "[MEOW]";
     Colors::SetColor(Colors::WHITE);
+    std::cout << " Starting scan...\n";
 
+    const auto totalStartTime = std::chrono::high_resolution_clock::now();
     auto datamodel = mem.AOBScanAll("RenderJob(EarlyRendering;", false, 1);
 
     if (!datamodel.empty()) {
         Colors::SetColor(Colors::GREEN);
-        std::cout << "\n[found] DataModel pattern at: " << FormatAddress(datamodel[0]) << "\n";
+        std::cout << "\n[found]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " DataModel pattern at: " << FormatAddress(datamodel[0]) << "\n";
 
         const uintptr_t RENDERVIEW_OFFSET = 0x1E8;
         const uintptr_t FAKE_OFFSET = 0x118;
@@ -304,28 +290,49 @@ int main() {
 
         uintptr_t renderView = mem.Read<uintptr_t>(datamodel[0] + RENDERVIEW_OFFSET);
         Colors::SetColor(Colors::CYAN);
-        std::cout << "[read] RenderView address: " << FormatAddress(renderView) << "\n";
+        std::cout << "[read]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " RenderView address: " << FormatAddress(renderView) << "\n";
 
         uintptr_t fakeDataModel = mem.Read<uintptr_t>(renderView + FAKE_OFFSET);
         Colors::SetColor(Colors::CYAN);
-        std::cout << "[read] FakeDataModel address: " << FormatAddress(fakeDataModel) << "\n";
+        std::cout << "[read]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " FakeDataModel address: " << FormatAddress(fakeDataModel) << "\n";
 
         uintptr_t realDataModel = mem.Read<uintptr_t>(fakeDataModel + REAL_OFFSET);
         Colors::SetColor(Colors::CYAN);
-        std::cout << "[read] RealDataModel address: " << FormatAddress(realDataModel) << "\n";
+        std::cout << "[read]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " RealDataModel address: " << FormatAddress(realDataModel) << "\n";
+
+        const auto totalEndTime = std::chrono::high_resolution_clock::now();
+        const auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(totalEndTime - totalStartTime);
 
         Colors::SetColor(Colors::GREEN);
-        std::cout << "\n[success] MEOW scan completed successfully!\n";
+        std::cout << "\n[success]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " Scan completed successfully!\n";
+
+        Colors::SetColor(Colors::YELLOW);
+        std::cout << "[time]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " Operation took " << totalDuration.count() / 1000.0 << "ms ("
+            << std::fixed << std::setprecision(3) << (totalDuration.count() / 1000000.0) << "s)\n";
     }
     else {
         Colors::SetColor(Colors::RED);
-        std::cout << "[read] Failed to find DataModel pattern\n";
+        std::cout << "[error]";
+        Colors::SetColor(Colors::WHITE);
+        std::cout << " Failed to find DataModel pattern\n";
     }
 
     Colors::SetColor(Colors::PURPLE);
-    std::cout << "\nMEOW COMPLETE\n";
+    std::cout << "\n[MEOW]";
     Colors::SetColor(Colors::WHITE);
-    std::cout << "Press Enter to exit...";
+    std::cout << " Scan complete!\n";
+
+    std::cout << "\nPress Enter to exit...";
     std::cin.get();
 
     CloseHandle(hProcess);
